@@ -89,6 +89,16 @@ def quantize_model(
     raise ValueError(f"Unsupported model type: {type(model)}")
 
 
+def is_quantized(model: Any) -> bool:
+  """Returns whether `model` is one `quantize_model` returned.
+
+  `quantize_model` on such a model replaces its quantization (it wraps the
+  unquantized class again), so a caller that layers its own quantization can
+  refuse a model that already has one.
+  """
+  return hasattr(type(model), "_unquantized_type")
+
+
 def quantize_linen_model(
     model: nn.Module,
     provider: qconfig.QuantizationProvider,

@@ -24,7 +24,7 @@ from qwix._src.core.dot_general import dot_general
 from qwix._src.core.einsum import einsum
 from qwix._src.core.qarray import QArray, dequantize, quantize_api as quantize
 from qwix._src.core.ragged_dot import ragged_dot, ragged_dot_general
-from qwix._src.model import quantize_model
+from qwix._src.model import is_quantized, quantize_model
 from qwix._src.providers.lora import LoraProvider, LoraRule, apply_lora_to_model
 from qwix._src.providers.odml import OdmlConversionProvider, OdmlQatProvider
 from qwix._src.providers.ptq import (
