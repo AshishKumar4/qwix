@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from absl.testing import absltest
+import jax
 from flax import nnx
 from jax import numpy as jnp
 from qwix._src import model as qwix_model
@@ -42,6 +43,44 @@ class QconfigTest(absltest.TestCase):
 
     self.model = MyModel(rngs=nnx.Rngs(0))
     self.x = jnp.ones((1, dim))
+
+  def test_current_rule_reaches_a_nested_provider(self):
+    """A provider whose rules match nothing at the current module leaves the
+    query to the provider nested under it, as its intercepted ops do."""
+    from flax import linen as nn  # pylint: disable=g-import-not-at-top
+    from qwix._src.providers import qt  # pylint: disable=g-import-not-at-top
+
+    seen = []
+
+    class Child(nn.Module):
+
+      @nn.compact
+      def __call__(self, x):
+        seen.append(qconfig.get_current_rule('dot_general'))
+        return nn.Dense(4)(x)
+
+    inner = qconfig.QuantizationRule(
+        module_path='.*', weight_qtype=jnp.int8, act_qtype=jnp.int8
+    )
+    child = qwix_model.quantize_model(Child(), qt.QtProvider([inner]))
+
+    class Parent(nn.Module):
+      child: nn.Module
+
+      @nn.compact
+      def __call__(self, x):
+        return self.child(x)
+
+    outer = qconfig.QuantizationRule(
+        module_path='no_module', weight_qtype=jnp.int8
+    )
+    parent = qwix_model.quantize_model(Parent(child), qt.QtProvider([outer]))
+    x = jnp.ones((1, 4))
+    parent.init(jax.random.key(0), x)
+    self.assertNotEmpty(seen)
+    self.assertTrue(all(rule is not None for rule in seen))
+    self.assertEqual(seen[-1].weight_qtype, jnp.int8)
+    self.assertEqual(seen[-1].module_path, '.*')
 
   def test_all_rules_used(self):
     rules = [
