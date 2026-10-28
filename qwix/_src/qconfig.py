@@ -134,13 +134,21 @@ class QuantizationProvider:
       rule = dataclasses.replace(rule, act_calibration_method='absmax')
     return rule
 
+  def _current_rule(self, op_name: str) -> QuantizationRule | None:
+    """This provider's rule for `op_name` at the current module, else the next active provider's.
+
+    A provider with no matching rule leaves the op to the providers it nests
+    in or under, as its intercepted ops do when no rule matches: the inner
+    call reaches the next active interceptor, this one disabled while it runs.
+    """
+    rule = self._get_current_rule_and_op_id(op_name, only_rule=True)[0]
+    return rule if rule is not None else get_current_rule(op_name)
+
   def get_intercept_map(self) -> dict[str, Callable[..., Any]]:
     """Returns the intercept map for interception.wrap_func_intercepted."""
     # Common functions that are intercepted by all quantization providers.
     intercept_map = {
-        'qwix._src.qconfig.get_current_rule': (
-            lambda op: self._get_current_rule_and_op_id(op, only_rule=True)[0]
-        )
+        'qwix._src.qconfig.get_current_rule': self._current_rule,
     }
     if interception.has_attribute('jax.experimental.pallas.pallas_call'):
       # 1. Disable interceptions during the pallas_call factory setup.
