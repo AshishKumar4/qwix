@@ -15,7 +15,9 @@
 
 from absl.testing import absltest
 from absl.testing import parameterized
+import jax
 from jax import numpy as jnp
+import numpy as np
 from qwix._src.core import conv_general
 from qwix._src.core import qarray
 
@@ -64,6 +66,46 @@ class ConvGeneralTest(parameterized.TestCase):
         dimension_numbers=dnums,
     )
     self.assertEqual(result.dtype, expected_output_dtype)
+
+  def test_bfloat16_scales_multiply_the_integer_product_in_float32(self):
+    rng = np.random.default_rng(0)
+    lhs = jnp.asarray(rng.integers(-127, 128, (2, 3, 8, 8)), jnp.int8)
+    rhs = jnp.asarray(rng.integers(-127, 128, (5, 3, 3, 3)), jnp.int8)
+    lhs_scale = jnp.asarray([[[[0.0123]]]], jnp.bfloat16)
+    rhs_scale = jnp.asarray([[[[0.00771]]]], jnp.bfloat16)
+    dnums = ('NCHW', 'OIHW', 'NCHW')
+    result = conv_general.conv_general_dilated(
+        qarray.QArray(lhs, lhs_scale),
+        qarray.QArray(rhs, rhs_scale),
+        window_strides=(1, 1),
+        padding='SAME',
+        dimension_numbers=dnums,
+    )
+    product = jax.lax.conv_general_dilated(
+        lhs.astype(jnp.float32),
+        rhs.astype(jnp.float32),
+        window_strides=(1, 1),
+        padding='SAME',
+        dimension_numbers=dnums,
+    )
+    expected = (
+        product * lhs_scale.astype(jnp.float32) * rhs_scale.astype(jnp.float32)
+    ).astype(jnp.bfloat16)
+    self.assertEqual(result.dtype, jnp.bfloat16)
+    np.testing.assert_array_equal(result, expected)
+
+  def test_an_unscaled_integer_product_stays_exact(self):
+    lhs = jnp.full((1, 64, 4, 4), 127, jnp.int8)
+    rhs = jnp.full((1, 64, 4, 4), 127, jnp.int8)
+    result = conv_general.conv_general_dilated(
+        lhs,
+        rhs,
+        window_strides=(1, 1),
+        padding='VALID',
+        dimension_numbers=('NCHW', 'OIHW', 'NCHW'),
+    )
+    self.assertEqual(result.dtype, jnp.int32)
+    self.assertEqual(int(result[0, 0, 0, 0]), 127 * 127 * 64 * 16)
 
 
 if __name__ == '__main__':

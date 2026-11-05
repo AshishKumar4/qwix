@@ -146,23 +146,19 @@ def _fast_conv_general_dilated(
   if rhs_zero_point is not None:
     raise ValueError('Asymmetric quantization for rhs is not supported.')
 
-  res = jax.lax.conv_general_dilated(
-      lhs_value,
-      rhs_value,
-      window_strides=window_strides,
-      padding=padding,
-      lhs_dilation=lhs_dilation,
-      rhs_dilation=rhs_dilation,
-      dimension_numbers=dimension_numbers,
-      feature_group_count=feature_group_count,
-      batch_group_count=batch_group_count,
-      preferred_element_type=preferred_element_type,
-      out_sharding=out_sharding,
+  # The scales multiply the product in at least float32, whatever the operands'
+  # dtype: a bfloat16 product of int8 codes would round before its scales, and
+  # XLA:GPU lowers an integer convolution with a float32 result alone. An
+  # unscaled integer product stays integer.
+  scaled_type = (
+      jnp.promote_types(result_type, jnp.float32)
+      if jnp.issubdtype(result_type, jnp.floating)
+      else result_type
   )
-  if lhs_zero_point is not None:
-    # TODO(zhuyunx): This value can be constant folded in SRQ scenarios.
-    res -= jax.lax.conv_general_dilated(
-        jnp.broadcast_to(lhs_zero_point, lhs_value.shape),
+
+  def product(lhs_value, rhs_value, element_type):
+    res = jax.lax.conv_general_dilated(
+        lhs_value,
         rhs_value,
         window_strides=window_strides,
         padding=padding,
@@ -171,8 +167,43 @@ def _fast_conv_general_dilated(
         dimension_numbers=dimension_numbers,
         feature_group_count=feature_group_count,
         batch_group_count=batch_group_count,
-        preferred_element_type=preferred_element_type,
+        preferred_element_type=element_type,
+        out_sharding=out_sharding,
     )
+    if lhs_zero_point is not None:
+      # TODO(zhuyunx): This value can be constant folded in SRQ scenarios.
+      res -= jax.lax.conv_general_dilated(
+          jnp.broadcast_to(lhs_zero_point, lhs_value.shape).astype(
+              lhs_value.dtype
+          ),
+          rhs_value,
+          window_strides=window_strides,
+          padding=padding,
+          lhs_dilation=lhs_dilation,
+          rhs_dilation=rhs_dilation,
+          dimension_numbers=dimension_numbers,
+          feature_group_count=feature_group_count,
+          batch_group_count=batch_group_count,
+          preferred_element_type=element_type,
+      )
+    return res.astype(scaled_type)
+
+  if jnp.issubdtype(preferred_element_type, jnp.integer):
+    # XLA:GPU runs no s8 x s8 -> s32 convolution (UNIMPLEMENTED on an A100 and
+    # an H100) and runs its float32 one: each product of two int8 codes is
+    # exact in float32, at most 2**14 in magnitude, so a contraction sums
+    # exactly until a partial sum passes 2**24, which int32 holds exactly.
+    # Every other platform convolves the integers.
+    res = jax.lax.platform_dependent(
+        lhs_value,
+        rhs_value,
+        cuda=lambda lhs, rhs: product(
+            lhs.astype(jnp.float32), rhs.astype(jnp.float32), jnp.float32
+        ),
+        default=lambda lhs, rhs: product(lhs, rhs, preferred_element_type),
+    )
+  else:
+    res = product(lhs_value, rhs_value, preferred_element_type)
 
   if lhs_scale is not None:
     transpose = get_transpose(dimension_numbers, for_lhs=True)
