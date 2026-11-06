@@ -107,6 +107,59 @@ class ConvGeneralTest(parameterized.TestCase):
     self.assertEqual(result.dtype, jnp.int32)
     self.assertEqual(int(result[0, 0, 0, 0]), 127 * 127 * 64 * 16)
 
+  @parameterized.named_parameters(
+      dict(testcase_name='1040_terms', channels=65, groups=1),
+      dict(testcase_name='1041_terms', channels=1041, groups=1, window=1),
+      dict(testcase_name='grouped_1041_terms', channels=1041, groups=2, window=1),
+      dict(testcase_name='windowed_3088_terms', channels=193, groups=1),
+  )
+  def test_the_float32_integer_convolution_is_exact(
+      self, channels, groups, window=4
+  ):
+    # Every code at 127 or -128, so each product is as large as int8 codes
+    # make it, and a float32 sum of more than 1024 of them may pass 2**24.
+    rng = np.random.default_rng(1)
+    codes = np.asarray([127, -128], np.int8)
+    lhs = codes[rng.integers(0, 2, (2, groups * channels, window, window))]
+    rhs = codes[rng.integers(0, 2, (3 * groups, channels, window, window))]
+    dnums = jax.lax.conv_dimension_numbers(
+        lhs.shape, rhs.shape, ('NCHW', 'OIHW', 'NCHW')
+    )
+
+    def convolve(lhs, rhs):
+      return jax.lax.conv_general_dilated(
+          lhs,
+          rhs,
+          window_strides=(1, 1),
+          padding='VALID',
+          dimension_numbers=dnums,
+          feature_group_count=groups,
+          preferred_element_type=jnp.float32,
+      )
+
+    result = conv_general.exact_integer_convolution(
+        jnp.asarray(lhs), jnp.asarray(rhs), dnums, groups, convolve
+    )
+    # The host's integer convolution: each output a dot of its group's codes.
+    wide_lhs = lhs.astype(np.int64).reshape(2, groups, channels, -1)
+    wide_rhs = rhs.astype(np.int64).reshape(groups, 3, channels, -1)
+    expected = np.einsum('bgck,gock->bgo', wide_lhs, wide_rhs).reshape(
+        2, 3 * groups, 1, 1
+    )
+    self.assertEqual(result.dtype, jnp.int32)
+    np.testing.assert_array_equal(np.asarray(result), expected)
+
+  def test_a_window_past_one_exact_chunk_is_refused(self):
+    lhs = jnp.ones((1, 1, 33, 33), jnp.int8)
+    rhs = jnp.ones((1, 1, 33, 33), jnp.int8)
+    dnums = jax.lax.conv_dimension_numbers(
+        lhs.shape, rhs.shape, ('NCHW', 'OIHW', 'NCHW')
+    )
+    with self.assertRaises(ValueError):
+      conv_general.exact_integer_convolution(
+          lhs, rhs, dnums, 1, lambda lhs, rhs: lhs
+      )
+
 
 if __name__ == '__main__':
   absltest.main()

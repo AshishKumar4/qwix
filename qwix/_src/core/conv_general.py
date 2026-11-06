@@ -18,6 +18,7 @@ from collections.abc import Sequence
 from typing import Any
 import jax
 from jax import numpy as jnp
+import numpy as np
 from qwix._src.core import numerics
 from qwix._src.core import qarray
 
@@ -100,6 +101,60 @@ def _slow_conv_general_dilated(
   )
 
 
+EXACT_FLOAT32_TERMS = 2**24 // 2**14
+"""The products of two int8 codes (each at most 2**7 in magnitude, so a product
+at most 2**14) a float32 sum holds exactly: every partial sum stays within
+2**24."""
+
+
+def exact_integer_convolution(
+    lhs: jax.Array,
+    rhs: jax.Array,
+    dimension_numbers: jax.lax.ConvDimensionNumbers,
+    feature_group_count: int,
+    convolve,
+) -> jax.Array:
+  """The int32 convolution of int8 codes `lhs` and `rhs` through `convolve`, a
+  float32 convolution of their values, summed exactly.
+
+  The contraction is split along the input features into chunks of at most
+  `EXACT_FLOAT32_TERMS` products an output (a chunk's features times the
+  kernel's window), each convolved in float32, exact, and their sum taken in
+  int32. A kernel window of more products than one chunk holds is refused.
+  """
+  lhs_spec, rhs_spec, _ = dimension_numbers
+  window = int(np.prod([rhs.shape[axis] for axis in rhs_spec[2:]]))
+  if window > EXACT_FLOAT32_TERMS:
+    raise ValueError(
+        f'an exact integer convolution in float32 sums at most'
+        f' {EXACT_FLOAT32_TERMS} products a chunk, and this kernel window holds'
+        f' {window}'
+    )
+  features = rhs.shape[rhs_spec[1]]
+  chunk = EXACT_FLOAT32_TERMS // window
+  total = None
+  for start in range(0, features, chunk):
+    stop = min(features, start + chunk)
+    rhs_part = jax.lax.slice_in_dim(rhs, start, stop, axis=rhs_spec[1])
+    # Each group's own input features, `features` a group on lhs's axis.
+    grouped = jnp.moveaxis(lhs, lhs_spec[1], -1)
+    leading = grouped.shape[:-1]
+    grouped = grouped.reshape(*leading, feature_group_count, features)
+    lhs_part = jnp.moveaxis(
+        grouped[..., start:stop].reshape(
+            *leading, feature_group_count * (stop - start)
+        ),
+        -1,
+        lhs_spec[1],
+    )
+    part = convolve(
+        lhs_part.astype(jnp.float32), rhs_part.astype(jnp.float32)
+    ).astype(jnp.int32)
+    total = part if total is None else total + part
+  assert total is not None
+  return total
+
+
 def _fast_conv_general_dilated(
     lhs: qarray.MaybeQArray,
     rhs: qarray.MaybeQArray,
@@ -156,8 +211,8 @@ def _fast_conv_general_dilated(
       else result_type
   )
 
-  def product(lhs_value, rhs_value, element_type):
-    res = jax.lax.conv_general_dilated(
+  def convolved(lhs_value, rhs_value, element_type):
+    return jax.lax.conv_general_dilated(
         lhs_value,
         rhs_value,
         window_strides=window_strides,
@@ -170,40 +225,47 @@ def _fast_conv_general_dilated(
         preferred_element_type=element_type,
         out_sharding=out_sharding,
     )
+
+  def product(lhs_value, rhs_value, convolve):
+    res = convolve(lhs_value, rhs_value)
     if lhs_zero_point is not None:
       # TODO(zhuyunx): This value can be constant folded in SRQ scenarios.
-      res -= jax.lax.conv_general_dilated(
+      res -= convolve(
           jnp.broadcast_to(lhs_zero_point, lhs_value.shape).astype(
               lhs_value.dtype
           ),
           rhs_value,
-          window_strides=window_strides,
-          padding=padding,
-          lhs_dilation=lhs_dilation,
-          rhs_dilation=rhs_dilation,
-          dimension_numbers=dimension_numbers,
-          feature_group_count=feature_group_count,
-          batch_group_count=batch_group_count,
-          preferred_element_type=element_type,
       )
     return res.astype(scaled_type)
 
   if jnp.issubdtype(preferred_element_type, jnp.integer):
     # XLA:GPU runs no s8 x s8 -> s32 convolution (UNIMPLEMENTED on an A100 and
-    # an H100) and runs its float32 one: each product of two int8 codes is
-    # exact in float32, at most 2**14 in magnitude, so a contraction sums
-    # exactly until a partial sum passes 2**24, which int32 holds exactly.
-    # Every other platform convolves the integers.
+    # an H100) and runs its float32 one, which sums the integer products
+    # exactly in chunks (`exact_integer_convolution`). Every other platform
+    # convolves the integers.
+    def in_float32(lhs, rhs):
+      return exact_integer_convolution(
+          lhs,
+          rhs,
+          dimension_numbers,
+          feature_group_count,
+          lambda lhs, rhs: convolved(lhs, rhs, jnp.float32),
+      ).astype(preferred_element_type)
+
     res = jax.lax.platform_dependent(
         lhs_value,
         rhs_value,
-        cuda=lambda lhs, rhs: product(
-            lhs.astype(jnp.float32), rhs.astype(jnp.float32), jnp.float32
+        cuda=lambda lhs, rhs: product(lhs, rhs, in_float32),
+        default=lambda lhs, rhs: product(
+            lhs, rhs, lambda lhs, rhs: convolved(lhs, rhs, preferred_element_type)
         ),
-        default=lambda lhs, rhs: product(lhs, rhs, preferred_element_type),
     )
   else:
-    res = product(lhs_value, rhs_value, preferred_element_type)
+    res = product(
+        lhs_value,
+        rhs_value,
+        lambda lhs, rhs: convolved(lhs, rhs, preferred_element_type),
+    )
 
   if lhs_scale is not None:
     transpose = get_transpose(dimension_numbers, for_lhs=True)
