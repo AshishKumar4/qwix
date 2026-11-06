@@ -18,6 +18,7 @@ from absl.testing import absltest
 from absl.testing import parameterized
 import jax
 from jax import numpy as jnp
+import numpy as np
 from qwix._src.core import conv_general
 from qwix._src.core import conv_general_qt
 from qwix._src.core import qarray
@@ -354,6 +355,39 @@ class ConvGeneralQtTest(parameterized.TestCase):
     for fq_grad, qt_grad in zip(fq_grads, qt_grads):
       self.assertEqual(fq_grad.shape, qt_grad.shape)
       self.assertLessEqual(float(mae(fq_grad, qt_grad)), expected_grad_mae)
+
+
+  def test_an_int8_kernel_gradient_over_a_wide_output_runs(self):
+    # The kernel's gradient convolves the input with the output's gradient as
+    # its kernel, a 64x64 window here, wider than one exact float32 chunk on
+    # CUDA (`conv_general.exact_integer_convolution`): it traces and runs on
+    # every platform, and is finite.
+    config = conv_general_qt.ConvGeneralQtConfig(
+        lhs_qtype=jnp.int8,
+        rhs_qtype=jnp.int8,
+        dlhs_grad_qtype=jnp.int8,
+        drhs_grad_qtype=jnp.int8,
+    )
+    rng = np.random.default_rng(3)
+    lhs = jnp.asarray(rng.standard_normal((1, 2, 66, 66)), jnp.float32)
+    rhs = jnp.asarray(rng.standard_normal((3, 2, 3, 3)), jnp.float32)
+
+    def loss(lhs, rhs):
+      return jnp.sum(
+          conv_general_qt.conv_general_qt(
+              lhs,
+              rhs,
+              config,
+              window_strides=(1, 1),
+              padding='VALID',
+              dimension_numbers=('NCHW', 'OIHW', 'NCHW'),
+          )
+      )
+
+    dlhs, drhs = jax.jit(jax.grad(loss, argnums=(0, 1)))(lhs, rhs)
+    self.assertEqual(drhs.shape, rhs.shape)
+    self.assertTrue(bool(jnp.all(jnp.isfinite(dlhs))))
+    self.assertTrue(bool(jnp.all(jnp.isfinite(drhs))))
 
 
 if __name__ == '__main__':

@@ -149,17 +149,61 @@ class ConvGeneralTest(parameterized.TestCase):
     self.assertEqual(result.dtype, jnp.int32)
     np.testing.assert_array_equal(np.asarray(result), expected)
 
-  def test_a_window_past_one_exact_chunk_is_refused(self):
-    lhs = jnp.ones((1, 1, 33, 33), jnp.int8)
-    rhs = jnp.ones((1, 1, 33, 33), jnp.int8)
+  @parameterized.named_parameters(
+      dict(testcase_name='33x33_window', window=33, channels=2),
+      dict(testcase_name='64x64_window', window=64, channels=1),
+  )
+  def test_a_window_past_one_exact_chunk_sums_exactly(self, window, channels):
+    # More products a position run than one chunk holds: the window's positions
+    # are chunked too, the kernel masked to each run.
+    rng = np.random.default_rng(2)
+    codes = np.asarray([127, -128], np.int8)
+    lhs = codes[rng.integers(0, 2, (1, channels, window + 1, window))]
+    rhs = codes[rng.integers(0, 2, (2, channels, window, window))]
     dnums = jax.lax.conv_dimension_numbers(
         lhs.shape, rhs.shape, ('NCHW', 'OIHW', 'NCHW')
     )
-    with self.assertRaises(ValueError):
-      conv_general.exact_integer_convolution(
-          lhs, rhs, dnums, 1, lambda lhs, rhs: lhs
+
+    def convolve(lhs, rhs):
+      return jax.lax.conv_general_dilated(
+          lhs,
+          rhs,
+          window_strides=(1, 1),
+          padding='VALID',
+          dimension_numbers=dnums,
+          preferred_element_type=jnp.float32,
       )
 
+    result = jax.jit(
+        lambda lhs, rhs: conv_general.exact_integer_convolution(
+            lhs, rhs, dnums, 1, convolve
+        )
+    )(jnp.asarray(lhs), jnp.asarray(rhs))
+    wide = lhs.astype(np.int64)
+    expected = np.stack(
+        [
+            np.einsum('chw,ochw->o', wide[0, :, row : row + window], rhs)
+            for row in range(2)
+        ],
+        axis=-1,
+    )[None, :, :, None]
+    np.testing.assert_array_equal(np.asarray(result), expected)
+
+  def test_a_jitted_integer_convolution_over_a_wide_window_runs(self):
+    # Every platform's branch is traced (`platform_dependent`), CUDA's chunked
+    # one among them: a CPU jit of a 33x33 int8 window traces and runs.
+    lhs = jnp.ones((1, 1, 33, 33), jnp.int8)
+    rhs = jnp.ones((1, 1, 33, 33), jnp.int8)
+    result = jax.jit(
+        lambda lhs, rhs: conv_general.conv_general_dilated(
+            lhs,
+            rhs,
+            window_strides=(1, 1),
+            padding='VALID',
+            dimension_numbers=('NCHW', 'OIHW', 'NCHW'),
+        )
+    )(lhs, rhs)
+    self.assertEqual(int(result[0, 0, 0, 0]), 33 * 33)
 
 if __name__ == '__main__':
   absltest.main()

@@ -117,41 +117,63 @@ def exact_integer_convolution(
   """The int32 convolution of int8 codes `lhs` and `rhs` through `convolve`, a
   float32 convolution of their values, summed exactly.
 
-  The contraction is split along the input features into chunks of at most
-  `EXACT_FLOAT32_TERMS` products an output (a chunk's features times the
-  kernel's window), each convolved in float32, exact, and their sum taken in
-  int32. A kernel window of more products than one chunk holds is refused.
+  An output's contraction, its group's input features times the kernel's window,
+  is split into chunks of at most `EXACT_FLOAT32_TERMS` products: the input
+  features in runs of `EXACT_FLOAT32_TERMS // window` where the window holds
+  fewer, else one feature at a time over the window's positions in runs of
+  `EXACT_FLOAT32_TERMS`, each run a kernel masked to its positions, which keeps
+  the kernel's shape, padding and dilation. Each chunk is convolved in float32,
+  exact, and the chunks are summed in int32, one convolution traced however many
+  chunks there are (a `lax.scan` over them).
   """
   lhs_spec, rhs_spec, _ = dimension_numbers
-  window = int(np.prod([rhs.shape[axis] for axis in rhs_spec[2:]]))
-  if window > EXACT_FLOAT32_TERMS:
-    raise ValueError(
-        f'an exact integer convolution in float32 sums at most'
-        f' {EXACT_FLOAT32_TERMS} products a chunk, and this kernel window holds'
-        f' {window}'
-    )
+  spatial = [rhs.shape[axis] for axis in rhs_spec[2:]]
+  window = int(np.prod(spatial))
   features = rhs.shape[rhs_spec[1]]
-  chunk = EXACT_FLOAT32_TERMS // window
-  total = None
-  for start in range(0, features, chunk):
-    stop = min(features, start + chunk)
-    rhs_part = jax.lax.slice_in_dim(rhs, start, stop, axis=rhs_spec[1])
-    # Each group's own input features, `features` a group on lhs's axis.
-    grouped = jnp.moveaxis(lhs, lhs_spec[1], -1)
-    leading = grouped.shape[:-1]
-    grouped = grouped.reshape(*leading, feature_group_count, features)
+  width = max(1, EXACT_FLOAT32_TERMS // window)
+  runs = -(-features // width)
+  # The window's position runs, each a 0/1 mask over the kernel's positions.
+  positions = min(window, EXACT_FLOAT32_TERMS)
+  masks = np.zeros((-(-window // positions), window), np.float32)
+  for index in range(masks.shape[0]):
+    masks[index, index * positions : (index + 1) * positions] = 1.0
+  # Each group's features padded with zero codes to whole runs, which add nothing.
+  padded = runs * width
+  grouped = jnp.moveaxis(lhs, lhs_spec[1], -1)
+  leading = grouped.shape[:-1]
+  grouped = grouped.reshape(*leading, feature_group_count, features)
+  grouped = jnp.pad(
+      grouped, [(0, 0)] * (grouped.ndim - 1) + [(0, padded - features)]
+  ).astype(jnp.float32)
+  kernel = jnp.moveaxis(rhs, (rhs_spec[1], *rhs_spec[2:]), (0, *range(1, 1 + len(spatial))))
+  kernel = jnp.pad(
+      kernel, [(0, padded - features)] + [(0, 0)] * (kernel.ndim - 1)
+  ).astype(jnp.float32)
+
+  def chunk(at):
+    run, mask = at // masks.shape[0], at % masks.shape[0]
+    lhs_part = jax.lax.dynamic_slice_in_dim(grouped, run * width, width, axis=-1)
     lhs_part = jnp.moveaxis(
-        grouped[..., start:stop].reshape(
-            *leading, feature_group_count * (stop - start)
-        ),
-        -1,
-        lhs_spec[1],
+        lhs_part.reshape(*leading, feature_group_count * width), -1, lhs_spec[1]
     )
-    part = convolve(
-        lhs_part.astype(jnp.float32), rhs_part.astype(jnp.float32)
-    ).astype(jnp.int32)
-    total = part if total is None else total + part
-  assert total is not None
+    rhs_part = jax.lax.dynamic_slice_in_dim(kernel, run * width, width, axis=0)
+    rhs_part = rhs_part * jnp.asarray(masks)[mask].reshape(
+        (1, *spatial) + (1,) * (kernel.ndim - 1 - len(spatial))
+    )
+    rhs_part = jnp.moveaxis(
+        rhs_part, (0, *range(1, 1 + len(spatial))), (rhs_spec[1], *rhs_spec[2:])
+    )
+    return convolve(lhs_part, rhs_part).astype(jnp.int32)
+
+  chunks = runs * masks.shape[0]
+  if chunks == 1:
+    return chunk(0)
+
+  def add(total, at):
+    return total + chunk(at), None
+
+  first = chunk(0)
+  total, _ = jax.lax.scan(add, first, jnp.arange(1, chunks))
   return total
 
 
