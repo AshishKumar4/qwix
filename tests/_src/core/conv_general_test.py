@@ -189,6 +189,30 @@ class ConvGeneralTest(parameterized.TestCase):
     )[None, :, :, None]
     np.testing.assert_array_equal(np.asarray(result), expected)
 
+  def test_a_small_contraction_keeps_its_channels(self):
+    # Three channels of a 3x3 window fit one chunk, convolved as they are.
+    lhs = jnp.ones((1, 3, 5, 5), jnp.int8)
+    rhs = jnp.ones((2, 3, 3, 3), jnp.int8)
+    dnums = jax.lax.conv_dimension_numbers(
+        lhs.shape, rhs.shape, ('NCHW', 'OIHW', 'NCHW')
+    )
+    shapes = []
+
+    def convolve(lhs, rhs):
+      shapes.append((lhs.shape, rhs.shape))
+      return jax.lax.conv_general_dilated(
+          lhs,
+          rhs,
+          window_strides=(1, 1),
+          padding='VALID',
+          dimension_numbers=dnums,
+          preferred_element_type=jnp.float32,
+      )
+
+    result = conv_general.exact_integer_convolution(lhs, rhs, dnums, 1, convolve)
+    self.assertEqual(shapes, [(lhs.shape, rhs.shape)])
+    np.testing.assert_array_equal(np.asarray(result), np.full((1, 2, 3, 3), 27))
+
   def test_a_jitted_integer_convolution_over_a_wide_window_runs(self):
     # Every platform's branch is traced (`platform_dependent`), CUDA's chunked
     # one among them: a CPU jit of a 33x33 int8 window traces and runs.

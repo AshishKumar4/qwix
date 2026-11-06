@@ -130,13 +130,11 @@ def exact_integer_convolution(
   spatial = [rhs.shape[axis] for axis in rhs_spec[2:]]
   window = int(np.prod(spatial))
   features = rhs.shape[rhs_spec[1]]
-  width = max(1, EXACT_FLOAT32_TERMS // window)
+  width = min(features, max(1, EXACT_FLOAT32_TERMS // window))
   runs = -(-features // width)
-  # The window's position runs, each a 0/1 mask over the kernel's positions.
+  # The window's position runs, each `positions` of the kernel's flattened ones.
   positions = min(window, EXACT_FLOAT32_TERMS)
-  masks = np.zeros((-(-window // positions), window), np.float32)
-  for index in range(masks.shape[0]):
-    masks[index, index * positions : (index + 1) * positions] = 1.0
+  position_runs = -(-window // positions)
   # Each group's features padded with zero codes to whole runs, which add nothing.
   padded = runs * width
   grouped = jnp.moveaxis(lhs, lhs_spec[1], -1)
@@ -151,13 +149,18 @@ def exact_integer_convolution(
   ).astype(jnp.float32)
 
   def chunk(at):
-    run, mask = at // masks.shape[0], at % masks.shape[0]
+    run, position_run = at // position_runs, at % position_runs
     lhs_part = jax.lax.dynamic_slice_in_dim(grouped, run * width, width, axis=-1)
     lhs_part = jnp.moveaxis(
         lhs_part.reshape(*leading, feature_group_count * width), -1, lhs_spec[1]
     )
     rhs_part = jax.lax.dynamic_slice_in_dim(kernel, run * width, width, axis=0)
-    rhs_part = rhs_part * jnp.asarray(masks)[mask].reshape(
+    # The run's positions of the window, its kernel masked to them.
+    flat = jnp.arange(window)
+    mask = (flat >= position_run * positions) & (
+        flat < (position_run + 1) * positions
+    )
+    rhs_part = rhs_part * mask.astype(jnp.float32).reshape(
         (1, *spatial) + (1,) * (kernel.ndim - 1 - len(spatial))
     )
     rhs_part = jnp.moveaxis(
@@ -165,7 +168,7 @@ def exact_integer_convolution(
     )
     return convolve(lhs_part, rhs_part).astype(jnp.int32)
 
-  chunks = runs * masks.shape[0]
+  chunks = runs * position_runs
   if chunks == 1:
     return chunk(0)
 
